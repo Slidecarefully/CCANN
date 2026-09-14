@@ -1,4 +1,19 @@
-// 引入 aligned_file_reader.h：抽象对齐 I/O 与 IORequest，供 SSD/PM 统一读写。
+// ============================================================================
+// 文件导读
+//
+// 本文件实现一次插入的两阶段路径，以及插入完成后的后台提交：
+//
+//   search_phase()             分配逻辑 ID、生成 PQ code、搜索并选择 target 邻居。
+//   insert_phase_pm()          论文 Soft Insert 的 PM/DAX 主实现。
+//   insert_phase()             普通块 I/O 和 OdinANN/CCANN-J baseline 的兼容路径。
+//   async_insert_in_place()    解耦 search phase 与 insert phase。
+//   insert_commit_thread()     完成延后的 PQ、邻居位置表和 ISS checkpoint。
+//
+// 阅读持久化代码时必须区分 C++ 语句执行顺序与 clwb/persist + sfence 保证的
+// 持久化顺序。论文 Figure 8 和 §4.2 讨论的是后者。
+// ============================================================================
+
+// 抽象对齐 I/O 与 IORequest，供 SSD/PM 统一读写。
 #include "aligned_file_reader.h"
 // 引入 libcuckoo/cuckoohash_map.hh：并发哈希表，用于 id2loc、tags 等共享映射。
 #include "libcuckoo/cuckoohash_map.hh"
@@ -50,18 +65,21 @@
 // 进入 ccann 命名空间，下面实现的函数都属于 CCANN 核心索引模块。
 namespace ccann {
 
-// 定义小块 PM 拷贝策略：不立即 drain/flush，并倾向 non-temporal 写；真正的持久化顺序由后续显式 flush/barrier 控制。
+// 构造 graph node 时只执行 non-temporal copy，不在每次 copy 后单独 flush/drain；
+// 后面会对完整 node 范围统一 clwb，并用 sfence 建立持久化边界。
 #define PMEM_TRANSFER_CACHE (PMEM_F_MEM_NODRAIN | PMEM_F_MEM_NOFLUSH | PMEM_F_MEM_NONTEMPORAL)
-// 定义大块 PM 拷贝策略：允许 temporal cache 行为，但同样把 drain/flush 交给调用方统一控制。
+// 大块拷贝版本允许 temporal store；同样由调用方统一 flush/drain。
 #define PMEM_TRANSFER_LARGE (PMEM_F_MEM_NODRAIN | PMEM_F_MEM_NOFLUSH | PMEM_F_MEM_TEMPORAL)
-// 定义普通 PM 拷贝策略，只禁止立即 drain；用于 location table 这类稍后统一建立持久化顺序的数据。
+// location-table 写仍由 PMDK 负责写回 cache line，但暂不 drain；随后一次 sfence
+// 可以同时等待一批 4-byte location entry，避免逐 entry 建立 barrier。
 #define PMEM_TRANSFER (PMEM_F_MEM_NODRAIN)
 
 
   // ============================================================================
   // search_phase
-  // 插入的搜索阶段：先为新向量分配稳定的逻辑 ID，并生成 PQ 压缩码；随后按当前 search_mode 在已有图上搜索候选节点，收集候选的精确坐标，最后通过
-  // prune_neighbors 得到真正要连接的新邻居集合。这个阶段只决定“新点应该连到谁”，还没有把图结构正式发布到持久化索引。
+  // 插入的搜索阶段，对应论文 Algorithm 1，并顺带完成 Algorithm 2 Lines 3-5：
+  // 先为新向量分配稳定的逻辑 ID 和 PQ code，再在已有图中搜索候选，最后把候选
+  // prune 成 target 自身的邻居集合。已有邻居的反向边更新仍留给 insert phase。
   // ============================================================================
   // 模板参数 T 表示向量坐标类型，TagT 表示用户侧 tag 类型；同一套逻辑可实例化为 float/int8/uint8。
   template<typename T, typename TagT>
@@ -71,7 +89,7 @@ namespace ccann {
                                            std::vector<uint64_t> &page_ref, std::vector<uint8_t> &out_pq_coords) {
     // 用断言检查这里依赖的内部不变量；失败说明索引布局或并发状态已与预期不一致。
     assert(reader != nullptr);
-    // 取得当前线程的 I/O 上下文；SSD 路径通常对应 io_uring/AIO，PM 路径仍复用统一接口。
+    // 取得当前线程的 reader 上下文；本函数末尾还可能用它释放搜索持有的 page 引用。
     void *ctx = reader->get_ctx();
     // 初始化计时器 read_t，后续用于把该阶段开销计入性能 breakdown。
     ANN_INIT_TIMING(read_t);
@@ -79,12 +97,9 @@ namespace ccann {
     ANN_INIT_TIMING(update_t);
     // 原子取得下一个逻辑 vector ID，并推进 cur_id；这个 ID 从现在起标识本次插入。
     uint32_t target_id = cur_id++;
-    // write PQ.
-
-    // save target PQ vector into memory data.
-    // 把新向量编码成 PQ code；完整坐标会进 graph node，而这份紧凑 code 供后续搜索快速估距。
+    // 先生成并发布 DRAM PQ code，使随后并发搜索能按 target_id 估距；PQ 文件的
+    // 持久化被延后到 insert_commit_thread()，崩溃后也可由完整 Vec 重建。
     std::vector<uint8_t> pq_coords = deflate_vector(point);
-    // chunk is dim
     // 开始记录下面这段逻辑的耗时，便于论文中的阶段级性能分解。
     ANN_START_TIMING(update_PQ_vec_time, update_t);
     // 按 target_id 计算该向量在连续 PQ byte array 中的起始位置。
@@ -109,7 +124,6 @@ namespace ccann {
     // 结束当前阶段计时并把耗时累计到统计项。
     ANN_END_TIMING(update_PQ_vec_time, update_t);
 
-    // l_index is candidate size.
     // 提前为候选节点的 ID→完整坐标映射预留容量，降低搜索阶段 rehash 开销。
     coord_map.reserve(2 * this->l_index);
 
@@ -121,7 +135,7 @@ namespace ccann {
     QueryStats stats;
     // LOG(INFO) << "Starting pipe search for insert.";
 
-    // NOTE: 10 is hardcoded mem_L for insert search, refer to CCANN configuration.
+    // 有小型 DRAM index 时固定取 10 个入口；否则从持久化图的 medoid 开始。
 
     void (SSDIndex<T, TagT>::*search_func)(
         const T *, uint32_t, uint32_t, const uint32_t, std::vector<Neighbor> &, tsl::robin_map<uint32_t, T *> *,
@@ -179,9 +193,15 @@ namespace ccann {
 
   // ============================================================================
   // insert_phase_pm
-  // PM/DAX 上的 Soft Insert 主路径。核心顺序是：为目标节点和受影响邻居分配新的物理 loc → 读取旧邻居版本 → 在新 loc 构造目标节点和邻居的新版本 →
-  // 先持久化目标向量/Tag，再发布 target 的 ID→loc → 持久化邻居新版本，再切换邻居的 ID→loc。这样 location table
-  // 充当“可见性开关”，避免读者看到半写入节点。PQ 与部分 metadata 更新被推迟到后台 commit 线程。
+  // PM/DAX 上的 Soft Insert 主路径，对应论文 Figure 8 和 §4.2。
+  // 节点在新 loc 构造，旧版本在 location 切换前一直有效，从而满足 R2/R3。两个
+  // 主要 barrier 建立以下持久化依赖：
+  //
+  //   1) Vec | Tag -> Loc(Vec)
+  //   2) Nbr | Loc(Vec) -> Loc(Nbr)
+  //
+  // 邻居的新 bytes 可以提前写入 cache，但只有 clwb+sfence 完成后才允许持久化
+  // Loc(Nbr)。PQ 可由 Vec 重建，因此放在后台、ISS checkpoint 之前完成。
   // ============================================================================
   // 模板参数 T 表示向量坐标类型，TagT 表示用户侧 tag 类型；同一套逻辑可实例化为 float/int8/uint8。
   template<typename T, typename TagT>
@@ -233,7 +253,9 @@ namespace ccann {
     cur_loc++;  // for target ID, atomic update.
     set_loc2id(target_id, target_id);
 #else
-    // 为每个受影响邻居的新版本以及最后的 target 节点一次性分配 out-of-place loc；locs[i] 对应 new_nhood[i]，末尾 loc 对应 target。
+    // 为每个受影响邻居的新版本以及 target 一次性预留 out-of-place loc：locs[i]
+    // 对应 new_nhood[i]，最后一个 loc 对应 target。此时这些 slot 仍未通过 id2loc
+    // 发布，reader 不会把它们当成有效节点。
     auto locs = this->alloc_loc(new_nhood.size() + 1, page_ref, pages_need_to_read);
 #endif
 
@@ -299,7 +321,8 @@ namespace ccann {
       page_buf_map[node_sector_no(new_nhood[i])] = update_buf + i * size_per_io;
 
       // (static_cast<char *>(faddr) + node_sector_no(new_nhood[i]) * SECTOR_LEN);
-      // NOTE: random PM I/O is super slow, use block read instead.
+      // 邻居旧版本按 4 KiB page 批量读入稳定的 DRAM snapshot；后面的剪枝和
+      // read-modify-write 都基于这份副本，避免在处理期间反复访问 PM。
     }
     // read new pages for RMW (might be in-place update).
     for (uint32_t i = new_nhood.size(); i < new_nhood.size() + pages_to_rmw.size(); ++i) {
@@ -350,10 +373,10 @@ namespace ccann {
         cur_off = writes_4k[i].offset;
       }
 
-// the last one
-// TODO: for PM, only needs one single barrier to be written (figure it out).
+// 把最后一段连续 page 也加入聚合写列表。CCANN PM 主路径通常直接改 DAX 映射；
+// 这里保留的 writes 列表主要处理落在 DRAM RMW buffer 中的 page。
 #ifdef CC_ANN
-      // merge all writes except the last one.
+      // 将最后一段连续 page 合并成一个块写请求。
       writes.push_back(
           IORequest(writes_4k[start_idx].offset, size_per_io * (i - start_idx), writes_4k[start_idx].buf, 0, 0));
 #else
@@ -376,7 +399,7 @@ namespace ccann {
     // 结束当前阶段计时并把耗时累计到统计项。
     ANN_END_TIMING(read_nodes_time, read_nodes_t);
 
-    // update the target node.
+    // 构造 target 的新 graph-node 版本：完整坐标和邻居逻辑 ID 存在同一个 node slot 中。
     // 开始记录下面这段逻辑的耗时，便于论文中的阶段级性能分解。
     ANN_START_TIMING(update_graph_time, update_t);
 
@@ -394,9 +417,7 @@ namespace ccann {
     //           << target_sector << " (" << target_sector * SECTOR_LEN << ") with " << target_node.nnbrs << "
     //           neighbors.";
 
-    // only store ids? that's good.
-    // but where to find the real coordinates?
-    // where is the PQ compressed vector data saved?
+    // graph node 保存完整坐标和邻居逻辑 ID；PQ 压缩码由独立的 PQ 数据结构维护。
     // 把新向量完整坐标写进 target graph-node slot。
     memcpy(target_node.coords, point, data_dim * sizeof(T));
     // 把逻辑邻居 ID 列表写入 target graph-node slot；这里存的是 ID，不是 loc。
@@ -440,15 +461,15 @@ namespace ccann {
       tags_writer->put_dax();
     }
 
-    // Target Vector|Tags -> ID2LOC
-    // 执行 PM persistence barrier（实现里是 sfence），保证 barrier 之前的 flush/store 在之后的可见性切换前完成。
+    // 第一条依赖：Vec|Tag -> Loc(Vec)。target location 在这个 sfence 之后才会写入，
+    // 所以崩溃恢复时只要 Loc(Vec) 存在，Vec 和 Tag 就一定已经持久化。
     reader->barrier_dax();
 
     // ANN_END_TIMING(update_graph_time, update_t);
     // 同步更新 DRAM tag map，让查询/删除逻辑立即能从 ID 解析用户 tag。
     tags.insert_or_assign(target_id, tag);
 
-    // update the neighbors
+    // 为每个选中邻居构造包含 target 反向边的新 graph-node 版本。
     // 开始记录下面这段逻辑的耗时，便于论文中的阶段级性能分解。
     ANN_START_TIMING(update_neighbor_time, update_neighbor_t);
     // 逐个处理 target 将要连接的旧邻居：为每个邻居生成包含 target 反向边的新版本。
@@ -494,9 +515,8 @@ namespace ccann {
         auto &thread_pq_buf = read_data->aligned_pq_coord_scratch;
         std::vector<float> tgt_dists(nhood.size(), 0.0f), nbr_dists(nhood.size(), 0.0f);
 
-        // TODO: do we really need to compute all distance?
-        // TODO: Key: can we only calculate part of the distances?
-        // TODO: batch this computation?
+        // DELTA_PRUNING baseline 一次算完所有候选距离；CCANN 默认的
+        // BATCH_PRUNING 分支在下面分批计算并尝试提前找到淘汰项。
 
         // 开始记录下面这段逻辑的耗时，便于论文中的阶段级性能分解。
         ANN_START_TIMING(prune_neighbor_time, prune_neighbor_t);
@@ -681,10 +701,11 @@ namespace ccann {
     std::vector<uint64_t> write_page_ref;
     // reader->wbc_write(writes, ctx, &write_page_ref);
 
-    // NOTE: File System provides atomic writes, ensuring that fallocate with zero populates.
+    // 新扩展的文件区间由 fallocate/zero-range 初始化为 0；恢复代码利用 location
+    // entry 的 0 值识别尚未发布的 ID。这里依赖的是初始化语义，不是整页原子写。
     // 开始记录下面这段逻辑的耗时，便于论文中的阶段级性能分解。
     ANN_START_TIMING(update_metadata_time, update_meta_t);
-    // Step 2. Update ID to Location Mapping in PM and DRAM
+    // 发布 target，并建立第二条依赖 Nbr|Loc(Vec) -> Loc(Nbr)。
 // 只有 out-of-place Soft Insert 才需要显式发布新的 ID→loc 映射。
 #ifndef IN_PLACE_RECORD_UPDATE
     // Update id2loc PMem mapping to make Target Vector|Tags Persistent.
@@ -693,7 +714,8 @@ namespace ccann {
     auto id2loc_dax = id2loc_writer->get_dax(id2loc_size, false);
     // location table 是 uint32_t 数组，因此用 target_id 直接计算对应 loc 槽位的 byte offset。
     auto target_id_offset = target_id * sizeof(uint32_t);
-    // 把数据复制到 PM 映射地址；这里使用的 flags 把 flush/drain 时机交给后续统一的 ordered-persistence 步骤。
+    // 写 target 的持久化 location entry。NODRAIN 让它与下面邻居 node 的 clwb
+    // 共用第二个 sfence；它在第一条 barrier 之后发出，所以不会先于 Vec/Tag 持久化。
     pmem_memcpy((char *) id2loc_dax + target_id_offset, &locs[new_nhood.size()], sizeof(uint32_t), PMEM_TRANSFER);
 
     // update locs
@@ -701,38 +723,32 @@ namespace ccann {
     // 更新 DRAM 中的并发 ID→loc 映射，让后续 reader 能按逻辑 ID 找到当前版本。
     id2loc_.insert_or_assign(target_id, locs[new_nhood.size()]);
 
-    // Neighbors -> ID2LOC
-    // batch flush caches
-    // 暂存邻居新版本需要 flush 的 PM 地址区间，等全部邻居构造完后统一 flush。
+    // 邻居新版本此前只是写入 cache；这里统一 clwb，避免逐节点 barrier。
     for (auto &flush_req : flush_requests) {
       // 对刚修改的 PM cache lines 发出 flush，先把数据推向 persistence domain；真正顺序由后续 sfence/barrier 确认。
       reader->flush_dax(flush_req.buf, flush_req.len);
     }
-    // 执行 PM persistence barrier（实现里是 sfence），保证 barrier 之前的 flush/store 在之后的可见性切换前完成。
+    // 第二个 sfence 同时确认 target location 和全部邻居新版本。此后才允许切换
+    // Loc(Nbr)，因此可见的新邻居版本不会指向未持久化的 target。
     reader->barrier_dax();
 
 // 启用细粒度并发：依赖并发 id2loc map 的原子更新，缩小传统全局/粗粒度锁的范围。
 #ifdef FINE_GRAINED_CONCURRENCY
-    // We do not need to lock idx_lock_table here, as id2loc_ is concurrent.
-    // id2loc_ is already a concurrent hash map.
-    // NOTE:
-    // We need to ensure the reader-side consistency.
-    // just use find_fn to make reader side being atomic.
+    // id2loc_ 是并发哈希表，无需 idx_lock_table；find_fn/更新接口保证单个映射项的原子访问，
+    // 使读线程不会观察到撕裂的 location 值。
     std::vector<uint64_t> orig_locs;
     // 逐个处理 target 将要连接的旧邻居：为每个邻居生成包含 target 反向边的新版本。
     for (uint32_t i = 0; i < new_nhood.size(); ++i) {
       // 保存邻居切换前的旧 loc，稍后 allocator 才能把旧 slot 回收。
       orig_locs.emplace_back(id2loc(new_nhood[i]));
-      // Atomically update DRAM id2loc and send (id, loc) to background
-      // insert_commit_thread for asynchronous PM id2loc table update.
-      // Sequence number (id) ensures ordering via the commit priority queue.
-      // 原子切换 DRAM 中该邻居的 ID→新 loc，同时把需要持久化的 (ID,loc) 推给后台 commit 路径。
+      // reader 侧先原子切换 DRAM id2loc；PM location entry 放入队列，由 commit
+      // 线程在 PQ 持久化后批量写入。立即看到新 loc 的 reader 也是安全的，因为
+      // 上面的第二个 sfence 已经完成。
       id2loc_insert_or_assign(new_nhood[i], (_u32) locs[i]);
     }
 
-    // NOTE:
-    // Delay update allocator
-    // i.e., loc2id is not updated immediately after id2loc update.
+    // 延迟更新 allocator 的 loc2id：先发布全部 id2loc，再一次性提交位置占用关系，
+    // 避免 allocator 在映射尚未就绪时复用这些 location。
     // 把 target 也追加到 ID 列表，使 allocator 更新函数能用与 locs 相同的顺序一次处理“邻居们 + target”。
     new_nhood.push_back(target_id);
     // 同步 allocator 的反向 loc→id/page_layout：释放旧 loc，并把新 loc 标记给对应 ID。
@@ -786,9 +802,8 @@ namespace ccann {
       }
     }
 
-    // Step 3. Update PQ Compressed Vector, this can be done in background
-    // Step 4. Update in memory graph if possible
-    // 封装后台提交任务：携带 target 的 PQ code、逻辑 ID，以及可选的小内存索引坐标副本。
+    // 把不影响图指针安全的收尾交给 commit 线程：持久化 PQ、刷出延后的
+    // Loc(Nbr)，然后把 target_id 纳入 ISS 连续完成前缀。
     auto commit_task = new CommitTask{
         .pq_coords = std::move(in_pq_coords),
         .target_id = target_id,
@@ -798,10 +813,11 @@ namespace ccann {
     // 把提交任务放入 commit queue；前台 Soft Insert 到这里无需等待 PQ/ISS 收尾即可返回。
     commit_tasks.push(commit_task);
 
-    // 锁住 target 和受影响邻居的逻辑 ID，保证 graph edge 与 version switch 的并发一致性。
+    // 图版本和映射切换均已完成，释放 target/neighbor 的逻辑 ID 写锁。
     unlock_vec(vec_lock_table, target_id, new_nhood);
 
-    // commit writes (in the background thread.)
+    // PM 主路径已经通过 DAX store+flush 完成核心写入；writes 仅覆盖前面形成的
+    // 兼容 RMW 请求，当前配置下一般为空。
     if (!writes.empty()) {
       // std::cout << "Flushing " << writes.size() + 1 << " writes to PMem." << std::endl;
       //   reader->write(writes, ctx);
@@ -839,8 +855,9 @@ namespace ccann {
 
   // ============================================================================
   // insert_phase
-  // 传统块 I/O / 非 PM（以及部分 baseline）插入路径。整体图更新逻辑和 PM 路径相似，但这里围绕 page read-modify-write、write-
-  // back cache、可选 journal 来组织 I/O，不依赖 DAX 上细粒度的 ordered persistence。该函数主要作为
+  // 传统块 I/O / 非 PM（以及部分 baseline）插入路径。整体图更新逻辑和 PM 路径
+  // 相似，但这里围绕 page read-modify-write、write-back cache 和可选 journal
+  // 组织 I/O，不依赖 DAX 上细粒度的 ordered persistence。该函数主要作为
   // SSD/OdinANN/CCANN-J 等路径的实现基础。
   // ============================================================================
   // 模板参数 T 表示向量坐标类型，TagT 表示用户侧 tag 类型；同一套逻辑可实例化为 float/int8/uint8。
@@ -952,10 +969,9 @@ namespace ccann {
       cur_off = writes_4k[i].offset;
     }
 
-// the last one
-// TODO: for PM, only needs one single barrier to be written (figure it out).
+    // 把最后一段连续 page 加入聚合写列表；真正的持久化屏障由后续提交阶段统一处理。
 #ifdef CC_ANN
-    // merge all writes except the last one.
+    // 将最后一段连续 page 合并成一个块写请求。
     writes.push_back(
         IORequest(writes_4k[start_idx].offset, size_per_io * (i - start_idx), writes_4k[start_idx].buf, 0, 0));
 #else
@@ -978,7 +994,7 @@ namespace ccann {
     // 结束当前阶段计时并把耗时累计到统计项。
     ANN_END_TIMING(read_nodes_time, read_nodes_t);
 
-    // update the target node.
+    // 构造 target 的新 graph-node 版本。
     // 开始记录下面这段逻辑的耗时，便于论文中的阶段级性能分解。
     ANN_START_TIMING(update_graph_time, update_t);
     // 把 node slot 的 loc 换算成所在 4 KiB sector/page 编号。
@@ -991,9 +1007,7 @@ namespace ccann {
     memcpy(target_node.coords, point, data_dim * sizeof(T));
     target_node.nnbrs = new_nhood.size();
     *(target_node.nbrs - 1) = target_node.nnbrs;
-    // only store ids? that's good.
-    // but where to find the real coordinates?
-    // where is the PQ compressed vector data saved?
+    // graph node 保存完整坐标和邻居逻辑 ID；PQ 压缩码由独立的 PQ 数据结构维护。
     // 复制这一段连续内存数据；源和目标的布局在此处已经按 ID/loc 关系确定。
     memcpy(target_node.nbrs, new_nhood.data(), new_nhood.size() * sizeof(uint32_t));
     tags.insert_or_assign(target_id, tag);
@@ -1009,7 +1023,7 @@ namespace ccann {
     // SECTOR_LEN
     //           << ") with " << target_node.nnbrs << " neighbors.";
 
-    // update the neighbors
+    // 为每个选中邻居构造包含 target 反向边的新 graph-node 版本。
     for (uint32_t i = 0; i < new_nhood.size(); ++i) {
       // 根据逻辑 ID 的当前 id2loc 映射取得该节点所在 sector。
       auto r_sector = node_sector_no(new_nhood[i]);
@@ -1215,8 +1229,7 @@ namespace ccann {
 
     unlock_vec(vec_lock_table, target_id, new_nhood);
 
-    // commit writes (in the background thread.)
-// 启用后台 I/O 线程时，前台只封装 BgTask，不同步等待块写完成。
+    // 提交块写：启用后台 I/O 线程时，前台只封装 BgTask，不同步等待写完成。
 #ifdef BG_IO_THREAD
     if (!page_ref.empty()) {
       auto bg_task = new BgTask{
@@ -1267,13 +1280,10 @@ namespace ccann {
     // }
 // 若构建 CCANN-J baseline，则额外生成/提交 journal 记录；Soft Insert 主设计本身不依赖 journal。
 #ifdef J_ANN
-    // the following part seems can be done asynchronously.
-    // ensure the updates are persistent,
-    // before clearing the journal.
+    // CCANN-J baseline 必须先同步 graph 数据页，再清理 journal，否则恢复时会丢失重放依据。
     // 开始记录下面这段逻辑的耗时，便于论文中的阶段级性能分解。
     ANN_START_TIMING(journal_time, journal_t);
     reader->sync();
-    // commit journal. How?
     // 确认 graph 更新持久化后清理 journal，结束该事务的 write-ahead logging 生命周期。
     journal->clear_journal();
     // 结束当前阶段计时并把耗时累计到统计项。
@@ -1305,8 +1315,12 @@ namespace ccann {
 
   // ============================================================================
   // async_insert_in_place
-  // 异步插入入口：搜索阶段仍在调用线程中完成，因为它决定候选和邻居；随后根据 ACC 观察到的 search/insert/compute 线程总负载，决定把 insert
-  // phase 提交到后台线程池，还是退化为当前线程同步执行。
+  // 异步插入入口，对应论文“decouple and delay insert phase”。搜索阶段仍在调用
+  // 线程中完成，因为它决定候选和邻居；随后 ACC 根据 search/insert/PNE worker
+  // 总负载决定把 insert phase 提交到线程池，还是留在当前线程以限制总并发。
+  //
+  // 异步闭包捕获的是原始 point 指针，没有复制完整向量。调用方必须保证该 buffer
+  // 在 insert phase 消费完之前仍有效；项目实验代码使用长期存活的数据集数组。
   // ============================================================================
   // 模板参数 T 表示向量坐标类型，TagT 表示用户侧 tag 类型；同一套逻辑可实例化为 float/int8/uint8。
   template<typename T, typename TagT>
@@ -1361,7 +1375,6 @@ namespace ccann {
     // 当逻辑并发量达到约两倍硬件核数时认为资源趋于饱和，ACC 开始限制额外异步任务。
     if (search_threads + insert_threads + calc_threads >= this->num_cpus * 2) {
       if (calc_threads <= search_threads) {  // calc thread is decreased significantly
-        // do not submission, fall back to synchronous insert
         // 计算 worker 已被显著压缩时不再继续堆后台 insert，改由当前线程同步完成以避免过度并发。
         should_async = false;
       }
@@ -1430,7 +1443,8 @@ namespace ccann {
 
   // ============================================================================
   // synchronize_insertions
-  // 等待异步插入线程池中的任务全部完成，用于析构、merge 或显式同步点，确保后续操作不会与尚未结束的 insert phase 并发。
+  // 等待 insert thread pool 中的 insert phase 全部完成。它不直接等待 commit_tasks
+  // 队列；析构流程会另行发送 terminate sentinel 并 join commit thread。
   // ============================================================================
   // 模板参数 T 表示向量坐标类型，TagT 表示用户侧 tag 类型；同一套逻辑可实例化为 float/int8/uint8。
   template<typename T, typename TagT>
@@ -1554,14 +1568,18 @@ namespace ccann {
     }
   }
 
-// ISS 每累计一批 commit task 再尝试推进连续 checkpoint，减少频繁写 super block 的开销。
+// ISS 每累计约一批 commit task 再尝试推进连续 checkpoint，减少 super block 写放大。
 #define COMMIT_INTERVAL 1000
 
 
   // ============================================================================
   // insert_commit_thread
-  // 后台 commit/ISS 线程：持久化延后的 PQ code，批量刷新邻居的 ID→loc 更新，并用最小堆按 target_id 整理乱序完成的插入。只有从 ckpt_id
-  // 开始形成连续完成前缀时才推进 checkpoint，并把新的 checkpoint 写入 super block，从而缩小 crash recovery 的检查范围。
+  // 后台 commit/ISS 线程：先持久化 target PQ，再批量刷出延后的邻居 ID→loc，
+  // 最后把 target_id 放入最小堆。插入可能乱序完成，所以只有堆顶恰好等于
+  // ckpt_id 时才能推进。
+  //
+  // 当前代码中的 ckpt_id 不是“最新完成 ID”，而是连续完成前缀之后的第一个 ID，
+  // 即恢复时需要重新检查的下界；写入 super block 的也是这个 next-ID 语义。
   // ============================================================================
   // 模板参数 T 表示向量坐标类型，TagT 表示用户侧 tag 类型；同一套逻辑可实例化为 float/int8/uint8。
   template<class T, class TagT>
@@ -1573,7 +1591,7 @@ namespace ccann {
 
     // 定义推进 ISS checkpoint 的局部函数：只消费从当前 ckpt_id 开始连续出现的完成 ID。
     auto process_commit_queue = [this, &commit_queue]() {
-      // 读取当前已确认的连续持久化前缀起点。
+      // ckpt_id 指向连续完成前缀之后的第一个、尚未确认的 ID。
       auto cur_ckpt_id = this->ckpt_id.load();
       uint32_t smallest_commit_id = 0;
       bool ckpt = false;
@@ -1583,27 +1601,24 @@ namespace ccann {
         // 读取当前已确认的连续持久化前缀起点。
         if (cur_ckpt_id == smallest_commit_id) {
           commit_queue.pop();
-          // 读取当前已确认的连续持久化前缀起点。
+          // 当前缺口已经补齐，下一次期望看到紧随其后的 ID。
           cur_ckpt_id = smallest_commit_id + 1;
           ckpt = true;
         } else {
-          // not continuous
+          // 堆顶大于 ckpt_id，说明连续前缀仍有缺口，暂时不能推进 checkpoint。
           break;
         }
       }
 // 只有启用 ISS 时才维护/持久化 checkpoint 与相关恢复优化状态。
 #ifndef NO_ISS
       if (ckpt) {
-        // 先在 DRAM 更新 ISS checkpoint，表示更早的 ID 已形成连续完成前缀。
+        // DRAM checkpoint 前移到“下一个待检查 ID”；小于它的插入均已完成收尾。
         this->ckpt_id.store(cur_ckpt_id);
-        // ensure all previous writes are persistent
         // 执行 PM persistence barrier（实现里是 sfence），保证 barrier 之前的 flush/store 在之后的可见性切换前完成。
         reader->barrier_dax();
-        // update current checkpoint id
-        // so we do not check these data during next recovery
         // 取得/扩展 DAX mmap 区域，使后续可以通过普通指针直接访问 PM 文件。
         auto index_addr = reader->get_dax(SECTOR_LEN, false);
-        // 当前实现复用 super block 起始 4 字节保存 checkpoint/计数语义。
+        // 当前实现复用 graph super block 起始 4 字节保存 next-ID checkpoint。
         auto npts_ofs = 0;
         // 使用 PMDK 的 persist copy：复制后直接保证这段数据达到持久化语义。
         pmem_memcpy_persist((char *) index_addr + npts_ofs, &cur_ckpt_id, sizeof(uint32_t));
@@ -1639,7 +1654,7 @@ namespace ccann {
         paras.Set<unsigned>("C", 750);
         paras.Set<float>("alpha", 1.2);
 
-        // TODO: fix distribution
+        // 小型内存索引的同步更新当前被禁用；这里只负责释放前台复制的坐标。
         // mem_index_->insert_point(task->point, paras, task->target_id);
         // LOG(INFO) << "Inserted point " << task->target_id << " into in-memory index.";
         // 当前内存索引插入代码被注释掉，因此至少释放前台为 commit 复制的向量坐标。
@@ -1655,7 +1670,7 @@ namespace ccann {
 #ifndef ANN_LARGE
       // 一个 PQ code 的持久化长度就是 CommitTask 中 pq_coords 的字节数。
       auto pq_bytes_per_vector = task->pq_coords.size() * sizeof(uint8_t);
-      // 一个 PQ code 的持久化长度就是 CommitTask 中 pq_coords 的字节数。
+      // 将文件映射扩展到能容纳 target_id 的位置，并按 sector 对齐映射长度。
       auto pq_size = ROUND_UP((target_id + 1) * pq_bytes_per_vector, SECTOR_LEN);
       auto pq_addr = this->pq_compressed_writer->get_dax(pq_size, false);
       // 按 target_id 计算该向量在连续 PQ byte array 中的起始位置。
@@ -1666,8 +1681,9 @@ namespace ccann {
 #endif
 #endif
 
-      // Drain pending background PM id2loc updates (from id2loc_insert_or_assign).
-      // Sequence number (target_id / id) ensures ordering via the commit priority queue.
+      // 批量持久化 id2loc_insert_or_assign() 延后提交的邻居 location entries。
+      // 这些 entry 在各 insert phase 完成第二个 sfence 后入队，因此此时持久化不会
+      // 破坏 Nbr|Loc(Vec) -> Loc(Nbr)。该队列只做批量收集，不负责 ISS 连续性。
       {
         auto null_pair = std::make_pair(kInvalidID, kInvalidID);
         // 取出细粒度并发路径延后持久化的邻居 (ID,new_loc) 更新。
@@ -1697,9 +1713,10 @@ namespace ccann {
         }
       }
 
-      // 该 target 的后台 PQ/id2loc 收尾已完成，把 target_id 放入最小堆等待形成连续 checkpoint。
+      // 当前 task 的 PQ 已持久化，且此刻可见的 pending neighbor mappings 已刷出；
+      // 将 target_id 交给 ISS 最小堆，等待补齐连续前缀中的缺口。
       commit_queue.push(target_id);
-      // commit in batch
+      // 每处理约 COMMIT_INTERVAL 个任务再尝试推进一次连续 checkpoint，降低 super block 写频率。
       // 每处理约 1000 个任务再批量尝试推进 checkpoint，降低 super block 持久化频率。
       if (n_tasks != 0 && n_tasks % COMMIT_INTERVAL == 0) {
         // 定义推进 ISS checkpoint 的局部函数：只消费从当前 ckpt_id 开始连续出现的完成 ID。
